@@ -157,9 +157,6 @@ ERROR_RECOVERY_DELAY = 5
 _logger = logging.getLogger(__name__)
 
 
-session = requests.Session()
-
-
 # Unfortunately, it is not possible to extend the Odoo
 # server command line arguments, so we resort to environment variables
 # to configure the runner (channels mostly).
@@ -201,20 +198,7 @@ def _connection_info_for(db_name):
     return connection_info
 
 
-session = requests.Session()
-
-
 def _async_http_get(scheme, host, port, user, password, db_name, job_uuid):
-    if not session.cookies:
-        # obtain an anonymous session
-        _logger.info("obtaining an anonymous session for the job runner")
-        url = "{}://{}:{}/queue_job/session".format(scheme, host, port)
-        auth = None
-        if user:
-            auth = (user, password)
-        response = session.get(url, timeout=30, auth=auth)
-        response.raise_for_status()
-
     # Method to set failed job (due to timeout, etc) as pending,
     # to avoid keeping it as enqueued.
     def set_job_pending():
@@ -250,7 +234,7 @@ def _async_http_get(scheme, host, port, user, password, db_name, job_uuid):
                 auth = (user, password)
             # we are not interested in the result, so we set a short timeout
             # but not too short so we trap and log hard configuration errors
-            response = session.get(url, timeout=1, auth=auth)
+            response = requests.get(url, timeout=1, auth=auth)
 
             # raise_for_status will result in either nothing, a Client Error
             # for HTTP Response codes between 400 and 500 or a Server Error
@@ -260,7 +244,6 @@ def _async_http_get(scheme, host, port, user, password, db_name, job_uuid):
             set_job_pending()
         except Exception:
             _logger.exception("exception in GET %s", url)
-            session.cookies.clear()
             set_job_pending()
 
     thread = threading.Thread(target=urlopen)
@@ -295,12 +278,28 @@ class Database(object):
                 "SELECT 1 FROM pg_tables WHERE tablename=%s", ("ir_module_module",)
             )
             if not cr.fetchone():
+                _logger.debug("%s doesn't seem to be an odoo db", self.db_name)
                 return False
             cr.execute(
                 "SELECT 1 FROM ir_module_module WHERE name=%s AND state=%s",
                 ("queue_job", "installed"),
             )
-            return cr.fetchone()
+            if not cr.fetchone():
+                _logger.debug("queue_job is not installed for db %s", self.db_name)
+                return False
+            cr.execute(
+                """SELECT COUNT(1)
+                FROM information_schema.triggers
+                WHERE event_object_table = %s
+                AND trigger_name = %s""",
+                ("queue_job", "queue_job_notify"),
+            )
+            if cr.fetchone()[0] != 3:  # INSERT, DELETE, UPDATE
+                _logger.error(
+                    "queue_job_notify trigger is missing in db %s", self.db_name
+                )
+                return False
+            return True
 
     def _initialize(self):
         with closing(self.conn.cursor()) as cr:
@@ -320,6 +319,11 @@ class Database(object):
         with closing(self.conn.cursor("select_jobs", withhold=True)) as cr:
             cr.execute(query, args)
             yield cr
+
+    def keep_alive(self):
+        query = "SELECT 1"
+        with closing(self.conn.cursor()) as cr:
+            cr.execute(query)
 
     def set_job_enqueued(self, uuid):
         with closing(self.conn.cursor()) as cr:
@@ -405,9 +409,7 @@ class QueueJobRunner(object):
     def initialize_databases(self):
         for db_name in self.get_db_names():
             db = Database(db_name)
-            if not db.has_queue_job:
-                _logger.debug("queue_job is not installed for db %s", db_name)
-            else:
+            if db.has_queue_job:
                 self.db_by_name[db_name] = db
                 with db.select_jobs("state in %s", (NOT_DONE,)) as cr:
                     for job_data in cr:
@@ -433,6 +435,12 @@ class QueueJobRunner(object):
 
     def process_notifications(self):
         for db in self.db_by_name.values():
+            if not db.conn.notifies:
+                # If there are no activity in the queue_job table it seems that
+                # tcp keepalives are not sent (in that very specific scenario),
+                # causing some intermediaries (such as haproxy) to close the
+                # connection, making the jobrunner to restart on a socket error
+                db.keep_alive()
             while db.conn.notifies:
                 if self._stop:
                     break
@@ -499,15 +507,14 @@ class QueueJobRunner(object):
                     self.wait_notification()
             except KeyboardInterrupt:
                 self.stop()
-            except Exception as e:
+            except InterruptedError:
                 # Interrupted system call, i.e. KeyboardInterrupt during select
-                if isinstance(e, select.error) and e[0] == 4:
-                    self.stop()
-                else:
-                    _logger.exception(
-                        "exception: sleeping %ds and retrying", ERROR_RECOVERY_DELAY
-                    )
-                    self.close_databases()
-                    time.sleep(ERROR_RECOVERY_DELAY)
+                self.stop()
+            except Exception:
+                _logger.exception(
+                    "exception: sleeping %ds and retrying", ERROR_RECOVERY_DELAY
+                )
+                self.close_databases()
+                time.sleep(ERROR_RECOVERY_DELAY)
         self.close_databases(remove_jobs=False)
         _logger.info("stopped")
